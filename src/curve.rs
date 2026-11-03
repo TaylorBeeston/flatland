@@ -58,7 +58,7 @@ impl Curve {
 }
 
 /// Write (once) a GLB holding a "Panel" node: a cylinder slice `width` m of arc, `height` m tall,
-/// centred at the origin, bulging toward +Z (the viewer) around an axis at (0, 0, radius).
+/// centred at the origin, edges bending toward -Z around an axis at (0, 0, -radius), i.e. concave to the user.
 /// UVs follow Flatland's panel.glb (+X -> u=0, +Y -> v=0). Double-sided.
 pub fn curved_panel_glb(width: f32, height: f32, radius: f32) -> Option<PathBuf> {
 	// quantize to 1 cm so live resizes don't rebuild the model every frame
@@ -67,7 +67,7 @@ pub fn curved_panel_glb(width: f32, height: f32, radius: f32) -> Option<PathBuf>
 	let mm = |v: f32| (v * 1000.0).round() as i64;
 	let dir = PathBuf::from(env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into()))
 		.join("flatland-curve");
-	let path = dir.join(format!("curve-{}x{}-r{}.glb", mm(width), mm(height), mm(radius)));
+	let path = dir.join(format!("curve2-{}x{}-r{}.glb", mm(width), mm(height), mm(radius)));
 	if path.exists() {
 		return Some(path);
 	}
@@ -79,11 +79,12 @@ pub fn curved_panel_glb(width: f32, height: f32, radius: f32) -> Option<PathBuf>
 		let t = i as f32 / segs as f32;
 		let th = (t - 0.5) * arc;
 		let (s, c) = th.sin_cos();
-		let (x, z) = (radius * s, radius * (1.0 - c));
+		// edges wrap toward -Z: concave as seen by the user (measured: +Z read as convex in headset)
+		let (x, z) = (radius * s, -radius * (1.0 - c));
 		for (y, v) in [(height / 2.0, 0.0f32), (-height / 2.0, 1.0)] {
 			pos.extend([x, y, z]);
 			uv.extend([1.0 - t, v]);
-			nrm.extend([-s, 0.0, c]);
+			nrm.extend([s, 0.0, c]); // centre normal stays +Z like panel.glb
 		}
 	}
 	for i in 0..segs as u16 {

@@ -212,6 +212,9 @@ impl Flatland {
 		if let Some(v) = env_flag("FLATLAND_SCALE_MODE") {
 			return v;
 		}
+		if std::env::var_os("FLATLAND_FIXED_RES").is_some() {
+			return true;
+		}
 		self.panel_item
 			.as_ref()
 			.and_then(|i| i.app_id.as_deref())
@@ -248,10 +251,27 @@ impl Flatland {
 	/// buffer size of a fixed-size client: reported resolution, else pinned min == max
 	fn fixed_res(&self) -> Option<Size2> {
 		let item = self.panel_item.as_ref()?;
-		item.resolution.or(match (item.min_size, item.max_size) {
-			(Some(a), Some(b)) if a.x == b.x && a.y == b.y && a.x > 0 && a.y > 0 => Some(b),
-			_ => None,
-		})
+		item.resolution
+			.or(match (item.min_size, item.max_size) {
+				(Some(a), Some(b)) if a.x == b.x && a.y == b.y && a.x > 0 && a.y > 0 => Some(b),
+				_ => None,
+			})
+			// panel shell can pass it (min/max events can race the panel shell attaching)
+			.or_else(|| {
+				let v = std::env::var("FLATLAND_FIXED_RES").ok()?;
+				let (w, h) = v.split_once('x')?;
+				let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
+				(w > 0 && h > 0).then(|| [w, h].into())
+			})
+	}
+	/// scale mode: size the panel from the fixed buffer at the current density
+	/// (don't derive density from the placeholder width like `resize` does)
+	fn snap_fixed_size(&mut self) {
+		if self.scale_mode()
+			&& let Some(r) = self.fixed_res()
+		{
+			self.set_size_px(r);
+		}
 	}
 	fn locked_aspect(&self) -> Option<f32> {
 		if !self.scale_mode() {
@@ -423,6 +443,7 @@ impl Flatland {
 				_ = shell.item().request_toplevel_resize(state.size_px());
 				state.derez_with_item_temp |= spawned_for_item;
 				state.panel_item = Some(PanelItem::new(shell));
+				state.snap_fixed_size();
 			},
 		))
 		.build()
@@ -466,7 +487,11 @@ impl Flatland {
 					item.max_size = size;
 				}
 				tracing::info!(?size, "toplevel max_size");
-				state.resize(state.screen_size);
+				if state.scale_mode() {
+					state.snap_fixed_size();
+				} else {
+					state.resize(state.screen_size);
+				}
 				state.enforce_pinned_size();
 			})
 			.on_toplevel_min_size_changed(|state: &mut Self, _, size| {
@@ -474,7 +499,11 @@ impl Flatland {
 					item.min_size = size;
 				}
 				tracing::info!(?size, "toplevel min_size");
-				state.resize(state.screen_size);
+				if state.scale_mode() {
+					state.snap_fixed_size();
+				} else {
+					state.resize(state.screen_size);
+				}
 				state.enforce_pinned_size();
 			})
 			.on_toplevel_app_id_changed(|state: &mut Self, _, app_id| {
@@ -482,6 +511,7 @@ impl Flatland {
 					item.app_id = Some(app_id);
 				}
 				state.enforce_pinned_size();
+				state.snap_fixed_size();
 			})
 			.on_toplevel_title_changed(|state: &mut Self, _, title| {
 				if let Some(item) = &mut state.panel_item {
