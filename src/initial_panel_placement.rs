@@ -59,13 +59,62 @@ async fn initial_placement(
 	Ok(())
 }
 
+/// Place the panel on the WayVR-style cylinder: anchor in stage space, or the HMD (upright) at launch.
+async fn curved_placement(
+	client: &Client<impl ClientHandler>,
+	spatial_root: Spatial,
+	curve: crate::curve::Curve,
+) -> Result<()> {
+	let (local_pos, local_rot) = curve.local_pose();
+	match curve.anchor {
+		Some(anchor) => {
+			let stage = Tracked::stage_spatial().await?;
+			spatial_root.set_relative_transform(
+				stage,
+				Transform::from_translation_rotation(anchor + local_pos, local_rot),
+			)?;
+		}
+		None => {
+			let hmd = Tracked::hmd_spatial().await?;
+			let root = client.root();
+			let Transform {
+				translation,
+				rotation,
+				..
+			} = client
+				.spatial_interface()
+				.get_relative_transform(root.clone(), hmd)
+				.await?
+				.map_err(|_| CreateError::InvalidRef)?;
+			let hmd_pos = Vec3::from(translation);
+			let hmd_rot = Quat::from(rotation);
+			let f = hmd_rot * Vec3::NEG_Z;
+			let q = Quat::from_rotation_y((-f.x).atan2(-f.z));
+			spatial_root.set_relative_transform(
+				root.clone(),
+				Transform::from_translation_rotation(hmd_pos + q * local_pos, q * local_rot),
+			)?;
+		}
+	}
+	info!(?curve, "placed curved panel");
+	Ok(())
+}
+
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub struct InitialPanelPlacement;
+pub struct InitialPanelPlacement {
+	pub curve: Option<crate::curve::Curve>,
+}
 impl<State: ValidState> CustomElement<State> for InitialPanelPlacement {
 	type Inner = ();
 	type Error = Error;
 
 	async fn create_inner(&self, ctx: &Context, info: CreateInnerInfo) -> Result<Self::Inner> {
+		if let Some(curve) = self.curve {
+			match curved_placement(&ctx.stardust_client, info.child_space.clone(), curve).await {
+				Ok(()) => return Ok(()),
+				Err(e) => tracing::warn!("curved placement failed ({e:?}); falling back"),
+			}
+		}
 		initial_placement(&ctx.stardust_client, info.child_space).await
 	}
 

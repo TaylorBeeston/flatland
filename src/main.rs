@@ -33,6 +33,7 @@ use touch_input::TouchHover;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _};
 
 pub mod close_button;
+pub mod curve;
 pub mod grab_ball;
 pub mod initial_panel_placement;
 // pub mod panel_shell_transfer;
@@ -225,17 +226,44 @@ impl Flatland {
 	fn show_close_button(&self) -> bool {
 		env_flag("FLATLAND_CLOSE_BUTTON").unwrap_or_else(|| !self.scale_mode())
 	}
+	/// scale mode: a client that pins min == max (host-mirror) gets configured to exactly
+	/// that size, so its geometry (our `resolution`) matches its buffer
+	fn enforce_pinned_size(&self) {
+		if !self.scale_mode() {
+			return;
+		}
+		let Some(item) = self.panel_item.as_ref() else {
+			return;
+		};
+		if let (Some(min), Some(max)) = (item.min_size, item.max_size)
+			&& min.x == max.x
+			&& min.y == max.y
+			&& max.x > 0
+			&& max.y > 0
+			&& item.resolution.is_none_or(|r| r.x != max.x || r.y != max.y)
+		{
+			_ = item.item.request_toplevel_resize(max);
+		}
+	}
+	/// buffer size of a fixed-size client: reported resolution, else pinned min == max
+	fn fixed_res(&self) -> Option<Size2> {
+		let item = self.panel_item.as_ref()?;
+		item.resolution.or(match (item.min_size, item.max_size) {
+			(Some(a), Some(b)) if a.x == b.x && a.y == b.y && a.x > 0 && a.y > 0 => Some(b),
+			_ => None,
+		})
+	}
 	fn locked_aspect(&self) -> Option<f32> {
 		if !self.scale_mode() {
 			return None;
 		}
-		let r = self.panel_item.as_ref()?.resolution?;
+		let r = self.fixed_res()?;
 		(r.x > 0 && r.y > 0).then(|| r.x as f32 / r.y as f32)
 	}
 	fn resize(&mut self, new_size: impl Into<Vec2F>) {
 		let new_size: Vec2F = new_size.into();
 		if self.scale_mode()
-			&& let Some(r) = self.panel_item.as_ref().and_then(|i| i.resolution)
+			&& let Some(r) = self.fixed_res()
 			&& r.x > 0
 			&& new_size.x > 0.0
 		{
@@ -335,8 +363,10 @@ impl Reify for Flatland {
 		_tasks: impl Tasker<Self>,
 		_props: (),
 	) -> impl Element<Self> {
-		InitialPanelPlacement
-			.build()
+		InitialPanelPlacement {
+			curve: curve::curve(),
+		}
+		.build()
 			.maybe_child(self.split_tethers())
 			.maybe_child(self.split_input(context))
 			.child(self.screen(context))
@@ -425,6 +455,7 @@ impl Flatland {
 				}
 			})
 			.on_toplevel_resolution_changed(|state: &mut Self, _, size| {
+				tracing::info!(x = size.x, y = size.y, "toplevel resolution");
 				if let Some(item) = &mut state.panel_item {
 					item.resolution = Some(size);
 				}
@@ -434,18 +465,23 @@ impl Flatland {
 				if let Some(item) = &mut state.panel_item {
 					item.max_size = size;
 				}
+				tracing::info!(?size, "toplevel max_size");
 				state.resize(state.screen_size);
+				state.enforce_pinned_size();
 			})
 			.on_toplevel_min_size_changed(|state: &mut Self, _, size| {
 				if let Some(item) = &mut state.panel_item {
 					item.min_size = size;
 				}
+				tracing::info!(?size, "toplevel min_size");
 				state.resize(state.screen_size);
+				state.enforce_pinned_size();
 			})
 			.on_toplevel_app_id_changed(|state: &mut Self, _, app_id| {
 				if let Some(item) = &mut state.panel_item {
 					item.app_id = Some(app_id);
 				}
+				state.enforce_pinned_size();
 			})
 			.on_toplevel_title_changed(|state: &mut Self, _, title| {
 				if let Some(item) = &mut state.panel_item {

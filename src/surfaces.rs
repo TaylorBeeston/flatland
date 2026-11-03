@@ -67,16 +67,33 @@ impl Surfaces<'_> {
 		};
 		let debug = (self.layer == Layer::SplitInput).then(DebugSettings::default);
 		let scl = size.extend(self.thickness);
+		let curved = (visuals && self.shell.is_some() && id == SurfaceId::Toplevel)
+			.then(crate::curve::curve)
+			.flatten()
+			.and_then(|c| crate::curve::curved_panel_glb(size.x, size.y, c.radius));
 
 		Entity::new(Shape::Box { size: scl.into() })
 			.pos(pos)
 			.component(has_input.then(|| keyboard_handler(self.shell, id)))
 			.component(has_input.then(|| mouse_handler(self.shell, id, self.scroll_multiplier)))
 			.build()
-			.maybe_child(self.shell.filter(|_| visuals).map(|shell| {
-				SurfaceModel::new(shell, id, panel_resource(), "Panel")
-					.scl(scl)
-					.build()
+			// curved mode: toplevel drawn on a cylinder-slice mesh baked in meters. SurfaceModel
+			// can't swap its resource, so key it by mesh path to rebuild it when the size changes.
+			.maybe_child(
+				self.shell
+					.filter(|_| visuals && curved.is_none())
+					.map(|shell| {
+						SurfaceModel::new(shell, id, panel_resource(), "Panel")
+							.scl(scl)
+							.build()
+					}),
+			)
+			.stable_children(self.shell.filter(|_| visuals).and_then(|shell| {
+				let path = curved.clone()?.to_string_lossy().into_owned();
+				Some((
+					path.clone(),
+					SurfaceModel::new(shell, id, Resource::Direct { path }, "Panel").build(),
+				))
 			}))
 			.maybe_child((visuals && self.shell.is_none()).then(|| {
 				Model::namespaced(Flatland::APP_ID, "panel")
