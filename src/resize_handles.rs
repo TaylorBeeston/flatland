@@ -278,6 +278,8 @@ pub struct ResizeHandlesInner {
 	change: watch::Receiver<(Posef, Vec2F)>,
 	pub min_size: Option<Vec2F>,
 	pub max_size: Option<Vec2F>,
+	/// width / height to keep while resizing, None = free stretch
+	pub aspect: Option<f32>,
 }
 impl ResizeHandlesInner {
 	pub async fn new(
@@ -391,6 +393,7 @@ impl ResizeHandlesInner {
 			change,
 			min_size,
 			max_size,
+			aspect: None,
 			stage_transform,
 			_stage_task,
 		};
@@ -482,6 +485,11 @@ impl ResizeHandlesInner {
 						.zy(),
 				) - (RESIZE_HANDLE_FLOATING * 2.0),
 		);
+		if let Some(a) = self.aspect.filter(|a| a.is_finite() && *a > 0.0) {
+			// closest point to the dragged size on the locked-aspect line
+			let h = ((a * size.x + size.y) / (a * a + 1.0)).max(0.05);
+			size = vec2(a * h, h);
+		}
 		size.x = size.x.max(min_size.x).min(max_size.x);
 		size.y = size.y.max(min_size.y).min(max_size.y);
 
@@ -529,6 +537,8 @@ pub struct ResizeHandles<State: ValidState> {
 	#[no_animate]
 	pub max_size: Option<Vec2F>,
 	#[no_animate]
+	pub aspect: Option<f32>,
+	#[no_animate]
 	pub on_change: CloneFnWrapper<dyn Fn(&mut State, Posef, Vec2F) + Send + Sync>,
 }
 // TODO: replace some oneway method calls with _event variants
@@ -559,6 +569,7 @@ impl<State: ValidState> AnimatedElement<State> for ResizeHandles<State> {
 	fn diff(&self, old: &Self, ctx: &Context, inner: &mut Self::Inner) {
 		inner.min_size = self.min_size;
 		inner.max_size = self.max_size;
+		inner.aspect = self.aspect;
 		inner.bottom.settings.connector_color = ctx.accent_color.color();
 		inner.top.settings.connector_color = ctx.accent_color.color();
 		if self.pose != old.pose {
@@ -644,6 +655,7 @@ async fn test_resize_handles() {
 						size: self.size,
 						min_size: None,
 						max_size: None,
+						aspect: None,
 						on_change: CloneFnWrapper(Arc::new(|state, pose, size| {
 							state.pose = pose;
 							state.size = size;

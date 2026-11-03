@@ -47,6 +47,14 @@ pub mod touch_input;
 const PANEL_THICKNESS: f32 = 0.01;
 const DEFAULT_DENSITY: f32 = 3000.0;
 
+fn env_flag(var: &str) -> Option<bool> {
+	match std::env::var(var).ok()?.trim() {
+		"1" | "true" | "on" | "yes" => Some(true),
+		"0" | "false" | "off" | "no" => Some(false),
+		_ => None,
+	}
+}
+
 fn env_density(var: &str) -> Option<f32> {
 	std::env::var(var).ok()?.trim().parse().ok()
 }
@@ -81,6 +89,8 @@ struct PanelItem {
 	app_id: Option<String>,
 	min_size: Option<Size2>,
 	max_size: Option<Size2>,
+	/// last buffer resolution the client reported, in px
+	resolution: Option<Size2>,
 
 	/// in px
 	cursor_pos: Vec2F,
@@ -98,6 +108,7 @@ impl PanelItem {
 			app_id: None,
 			min_size: None,
 			max_size: None,
+			resolution: None,
 			cursor_pos: [0.0; 2].into(),
 			cursor: None,
 			children: Vec::new(),
@@ -193,9 +204,45 @@ impl Flatland {
 		self.screen_size = self.px_to_m(size.into());
 		self.clamp_pointer();
 	}
+	/// host-mirror panels (or FLATLAND_SCALE_MODE=1) keep a fixed buffer resolution:
+	/// resizing scales the panel (changes density) at the buffer's aspect instead of
+	/// asking the client for a new size
+	fn scale_mode(&self) -> bool {
+		if let Some(v) = env_flag("FLATLAND_SCALE_MODE") {
+			return v;
+		}
+		self.panel_item
+			.as_ref()
+			.and_then(|i| i.app_id.as_deref())
+			.is_some_and(|id| id.starts_with("host-mirror"))
+	}
+	/// eject + split diamonds; off for host-mirror panels, FLATLAND_HANDLES=1/0 overrides
+	pub fn show_extra_handles(&self) -> bool {
+		env_flag("FLATLAND_HANDLES").unwrap_or_else(|| !self.scale_mode())
+	}
+	fn locked_aspect(&self) -> Option<f32> {
+		if !self.scale_mode() {
+			return None;
+		}
+		let r = self.panel_item.as_ref()?.resolution?;
+		(r.x > 0 && r.y > 0).then(|| r.x as f32 / r.y as f32)
+	}
 	fn resize(&mut self, new_size: impl Into<Vec2F>) {
+		let new_size: Vec2F = new_size.into();
+		if self.scale_mode()
+			&& let Some(r) = self.panel_item.as_ref().and_then(|i| i.resolution)
+			&& r.x > 0
+			&& new_size.x > 0.0
+		{
+			let d = r.x as f32 / new_size.x;
+			if d.is_finite() && (100.0..=20000.0).contains(&d) {
+				self.density = d;
+			}
+			self.set_size_px(r);
+			return;
+		}
 		let old_size_px = self.size_px();
-		self.screen_size = new_size.into();
+		self.screen_size = new_size;
 		let Some(item) = self.panel_item.as_ref() else {
 			return;
 		};
@@ -292,12 +339,13 @@ impl Reify for Flatland {
 }
 impl Flatland {
 	fn screen(&self, context: &Context) -> impl Element<Self> + use<> {
-		let item = self.panel_item.as_ref();
+		let item = self.panel_item.as_ref().filter(|_| !self.scale_mode());
 		ResizeHandles::<Self> {
 			pose: self.screen_pose,
 			size: self.screen_size,
 			min_size: item.and_then(|i| i.min_size).map(|s| self.px_to_m(s)),
 			max_size: item.and_then(|i| i.max_size).map(|s| self.px_to_m(s)),
+			aspect: self.locked_aspect(),
 			on_change: CloneFnWrapper(Arc::new(|state, pose, size| {
 				state.screen_pose = pose;
 				state.resize(size);
@@ -346,7 +394,7 @@ impl Flatland {
 	}
 
 	fn eject_handle(&self) -> Option<impl Element<Self> + use<>> {
-		self.panel_item.is_some().then(|| {
+		(self.panel_item.is_some() && self.show_extra_handles()).then(|| {
 			Handle::new(
 				[0.0, -self.screen_size.y / 2.0, 0.0],
 				|state: &mut Self, pos| {
@@ -371,7 +419,12 @@ impl Flatland {
 					context.stop();
 				}
 			})
-			.on_toplevel_resolution_changed(|state: &mut Self, _, size| state.set_size_px(size))
+			.on_toplevel_resolution_changed(|state: &mut Self, _, size| {
+				if let Some(item) = &mut state.panel_item {
+					item.resolution = Some(size);
+				}
+				state.set_size_px(size)
+			})
 			.on_toplevel_max_size_changed(|state: &mut Self, _, size| {
 				if let Some(item) = &mut state.panel_item {
 					item.max_size = size;

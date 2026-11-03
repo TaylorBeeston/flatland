@@ -35,7 +35,9 @@ fn mix_pose(from: &Posef, to: &Posef, t: f32) -> Posef {
 
 impl Flatland {
 	pub fn split_handle(&self) -> Option<impl Element<Self> + use<>> {
-		(self.split_input_surface.is_none() || self.pulling_split).then(|| {
+		let show = self.show_extra_handles()
+			&& (self.split_input_surface.is_none() || self.pulling_split);
+		show.then(|| {
 			Handle::new(
 				[-self.screen_size.x / 2.0, -self.screen_size.y / 2.0, 0.0],
 				|state: &mut Self, pos| {
@@ -58,6 +60,7 @@ impl Flatland {
 				size,
 				min_size: Some(size),
 				max_size: Some(size),
+				aspect: None,
 				on_change: CloneFnWrapper(Arc::new(|state, pose, _| state.move_split(pose))),
 			}
 			.build()
