@@ -45,6 +45,11 @@ pub mod surfaces;
 pub mod touch_input;
 
 const PANEL_THICKNESS: f32 = 0.01;
+const DEFAULT_DENSITY: f32 = 3000.0;
+
+fn env_density(var: &str) -> Option<f32> {
+	std::env::var(var).ok()?.trim().parse().ok()
+}
 
 // #[tokio::main(flavor = "current_thread")]
 #[tokio::main]
@@ -137,7 +142,7 @@ impl Default for Flatland {
 
 			panel_item: None,
 
-			density: 3000.0,
+			density: DEFAULT_DENSITY,
 			mouse_scroll_multiplier: 1.0,
 		}
 	}
@@ -157,9 +162,21 @@ impl ClientState for Flatland {
 		struct Args {
 			#[arg(short, long, default_value_t = false)]
 			derez_with_item: bool,
+			/// Panel pixels per meter (default 3000). Falls back to $FLATLAND_DENSITY,
+			/// then $STARDUST_PANEL_DENSITY. Each window has its own Flatland process,
+			/// so this is per panel.
+			#[arg(long, value_name = "PX_PER_M")]
+			density: Option<f32>,
 		}
 
-		self.derez_with_item = Args::parse().derez_with_item;
+		let args = Args::parse();
+		self.derez_with_item = args.derez_with_item;
+		self.density = args
+			.density
+			.or_else(|| env_density("FLATLAND_DENSITY"))
+			.or_else(|| env_density("STARDUST_PANEL_DENSITY"))
+			.filter(|d| d.is_finite() && (100.0..=20000.0).contains(d))
+			.unwrap_or(DEFAULT_DENSITY);
 	}
 }
 impl Flatland {
