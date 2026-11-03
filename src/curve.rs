@@ -65,8 +65,7 @@ pub fn curved_panel_glb(width: f32, height: f32, radius: f32) -> Option<PathBuf>
 	let q = |v: f32| (v * 100.0).round().max(1.0) / 100.0;
 	let (width, height) = (q(width), q(height));
 	let mm = |v: f32| (v * 1000.0).round() as i64;
-	let dir = PathBuf::from(env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into()))
-		.join("flatland-curve");
+	let dir = cache_dir();
 	let path = dir.join(format!("curve3-{}x{}-r{}.glb", mm(width), mm(height), mm(radius)));
 	if path.exists() {
 		return Some(path);
@@ -139,4 +138,9 @@ pub fn curved_panel_glb(width: f32, height: f32, radius: f32) -> Option<PathBuf>
 	std::fs::rename(&tmp, &path).ok()?;
 	tracing::info!(?path, segs, "wrote curved panel mesh");
 	Some(path)
+}
+
+/// $XDG_RUNTIME_DIR/flatland-curve: meshes, shared head anchor, recenter request.
+pub fn cache_dir() -> PathBuf {
+	PathBuf::from(env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())).join("flatland-curve")
 }
