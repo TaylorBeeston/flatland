@@ -220,6 +220,11 @@ impl Flatland {
 	pub fn show_extra_handles(&self) -> bool {
 		env_flag("FLATLAND_HANDLES").unwrap_or_else(|| !self.scale_mode())
 	}
+	/// Host-mirror panels hide the close button: black-hole collapses panels onto the hand,
+	/// which can trip it. Override with FLATLAND_CLOSE_BUTTON=1/0.
+	fn show_close_button(&self) -> bool {
+		env_flag("FLATLAND_CLOSE_BUTTON").unwrap_or_else(|| !self.scale_mode())
+	}
 	fn locked_aspect(&self) -> Option<f32> {
 		if !self.scale_mode() {
 			return None;
@@ -356,7 +361,7 @@ impl Flatland {
 		.maybe_child(self.eject_handle())
 		.maybe_child(self.split_handle())
 		.maybe_child(self.panel_shell(context))
-		.child(self.close_button(context))
+		.maybe_child(self.show_close_button().then(|| self.close_button(context)))
 		.child(self.side_text())
 		.child(self.surfaces(
 			context,
