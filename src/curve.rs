@@ -67,7 +67,7 @@ pub fn curved_panel_glb(width: f32, height: f32, radius: f32) -> Option<PathBuf>
 	let mm = |v: f32| (v * 1000.0).round() as i64;
 	let dir = PathBuf::from(env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into()))
 		.join("flatland-curve");
-	let path = dir.join(format!("curve2-{}x{}-r{}.glb", mm(width), mm(height), mm(radius)));
+	let path = dir.join(format!("curve3-{}x{}-r{}.glb", mm(width), mm(height), mm(radius)));
 	if path.exists() {
 		return Some(path);
 	}
