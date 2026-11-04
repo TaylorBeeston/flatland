@@ -35,6 +35,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _};
 pub mod close_button;
 pub mod grab_ball;
 pub mod initial_panel_placement;
+pub mod key_sink;
 // pub mod panel_shell_transfer;
 pub mod pointer_input;
 pub mod resize_handles;

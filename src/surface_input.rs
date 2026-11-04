@@ -11,6 +11,15 @@ use stardust_xr_panels::panel_item::{ModifierState, ScrollSource, SurfaceId};
 pub fn keyboard_handler(shell: Option<&Shell>, surface_id: SurfaceId) -> KeyboardHandler<Flatland> {
 	let item = shell.map(|s| s.item().clone());
 	KeyboardHandler::<Flatland>::new().on_key_async(move |key, timestamp| {
+		// host-mirror key sink: hand the raw Stardust key (evdev code + xkb modifier masks)
+		// straight to the mirror, skipping wl_keyboard -> winit. Falls back to the panel item.
+		if crate::key_sink::send(
+			key.keycode,
+			key.pressed,
+			[key.modifiers.depressed, key.modifiers.latched, key.modifiers.locked, key.modifiers.layout_group],
+		) {
+			return;
+		}
 		if let Some(item) = &item {
 			_ = item.key(
 				surface_id,
