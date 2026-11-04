@@ -313,7 +313,10 @@ impl<State: ValidState> CustomElement<State> for InitialPanelPlacement {
 			match curved_placement(&ctx.stardust_client, &info.child_space, curve, req).await {
 				Ok(()) => {
 					spawn_recenter_watch(ctx.stardust_client.clone(), info.child_space.clone(), curve, req);
-					if curve.anchor.is_none() && !env::var("FLATLAND_EDGE_GRAB").is_ok_and(|v| v == "0") {
+					// one Flatland owns the group grab (the handle bead or, opt-in, the rim) + wire rings
+					let owner = env::var("FLATLAND_CYLINDER_WIRE").is_ok_and(|v| v == "1")
+						|| env::var("FLATLAND_EDGE_GRAB").is_ok_and(|v| v == "1");
+					if curve.anchor.is_none() && owner {
 						spawn_edge_grab(ctx.stardust_client.clone(), curve);
 					}
 					return Ok(());
@@ -379,6 +382,11 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 		return;
 	};
 	let edge: f32 = env::var("FLATLAND_EDGE_GRAB_M").ok().and_then(|v| v.parse().ok()).unwrap_or(0.07);
+	// default: grab only a small bead on the lower ring under the gap (deliberate); FLATLAND_EDGE_GRAB=1 = old rim grab
+	let rim = env::var("FLATLAND_EDGE_GRAB").is_ok_and(|v| v == "1");
+	let bead_r: f32 = env::var("FLATLAND_HANDLE_GRAB_M").ok().and_then(|v| v.parse().ok()).unwrap_or(0.045);
+	// handle arc position (m from the anchor's forward); the shell lays the gap out at 0
+	let bead_arc: f32 = env::var("FLATLAND_HANDLE_ARC_M").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
 	let wire = env::var("FLATLAND_CYLINDER_WIRE").is_ok_and(|v| v == "1");
 	tokio::spawn(async move {
 		let res: Result<()> = async {
@@ -393,8 +401,10 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 			let mut start: Option<(Vec3, Adjust)> = None;
 			let mut pending: Option<Adjust> = None;
 			let mut last_write = Instant::now();
-			let mut drawn: Option<(Vec3, f32, f32, f32, bool)> = None;
-			info!(pw, ph, edge, wire, "edge grab ready");
+			let mut drawn: Option<(Vec3, f32, f32, f32, f32, u8)> = None;
+			let hmd = Tracked::hmd_spatial().await.ok();
+			let mut last_axis_log = Instant::now() - Duration::from_secs(60);
+			info!(pw, ph, edge, rim, bead_r, bead_arc, wire, "group grab ready");
 			loop {
 				tokio::time::sleep(Duration::from_millis(16)).await;
 				let Some(head) = read_anchor(None) else { continue };
@@ -404,6 +414,29 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 				let centre_az = world_az(head.yaw, curve.on_radius(r, pw).yaw + adj.yaw_deg.to_radians());
 				let half_az = crate::curve::edge_half_az(pw, r);
 				let yc = head.pos.y + adj.height_m;
+				let gap = 0.06;
+				let bead_az = world_az(head.yaw, bead_arc / r + adj.yaw_deg.to_radians());
+				let bead = vec3(head.pos.x + r * bead_az.sin(), yc - ph / 2.0 - gap, head.pos.z - r * bead_az.cos());
+				let on_bead = |p: Vec3| p.distance(bead) < bead_r;
+				// measured off-axis: live head vs the cylinder axis (anchor), logged every 5 s
+				if let Some(hmd) = &hmd {
+					if last_axis_log.elapsed() > Duration::from_secs(5) {
+						last_axis_log = Instant::now();
+						if let Ok(h) = hmd_in(&client, &frame, hmd).await {
+							let off = vec3(h.pos.x - head.pos.x, 0.0, h.pos.z - head.pos.z);
+							let fwd = Quat::from_rotation_y(head.yaw) * Vec3::NEG_Z;
+							let right = Quat::from_rotation_y(head.yaw) * Vec3::X;
+							info!(
+								off_cm = off.length() * 100.0,
+								fwd_cm = off.dot(fwd) * 100.0,
+								right_cm = off.dot(right) * 100.0,
+								dy_cm = (h.pos.y - head.pos.y) * 100.0,
+								face_minus_gap_deg = wrap(h.yaw - (head.yaw - (bead_arc / r + adj.yaw_deg.to_radians()))).to_degrees(),
+								"head vs cylinder axis"
+							);
+						}
+					}
+				}
 				let on_edge = |p: Vec3| {
 					let (az, d) = polar(head.pos, p);
 					let daz = wrap(az - centre_az).abs();
@@ -422,10 +455,10 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 				action.update(
 					true,
 					&input,
-					|i| point(i).is_some_and(|p| on_edge(p)),
+					|i| point(i).is_some_and(|p| if rim { on_edge(p) } else { on_bead(p) }),
 					|i| match i.input() {
-						InputDataType::Hand { .. } => i.datamap_f32("pinch_strength") > 0.90,
-						_ => i.datamap_f32("grab") > 0.90,
+						InputDataType::Hand { .. } => i.datamap_f32("pinch_strength") > 0.95,
+						_ => i.datamap_f32("grab") > 0.95,
 					},
 				);
 				let p = action.actor().and_then(|a| point(a));
@@ -461,8 +494,10 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 					}
 				}
 				if let Some(lines) = &lines {
-					let hot = start.is_some();
-					let key = (head.pos, head.yaw, r, yc, hot);
+					let near = input.input().keys().any(|i| point(i).is_some_and(|p| p.distance(bead) < bead_r * 2.5));
+					let state: u8 = if start.is_some() { 2 } else if near { 1 } else { 0 };
+					let hot = state == 2;
+					let key = (head.pos, head.yaw, r, yc, bead_az, state);
 					if drawn != Some(key) {
 						drawn = Some(key);
 						let col: Color = if hot { rgba_linear!(0.5, 0.7, 1.0, 0.6) } else { rgba_linear!(0.35, 0.45, 0.6, 0.18) };
@@ -478,8 +513,28 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 							cyclic: true,
 						};
 						// rings only, clear of the screens (never across content)
-						let gap = 0.06;
-						let ls = vec![ring(yc + ph / 2.0 + gap), ring(yc - ph / 2.0 - gap)];
+						let mut ls = vec![ring(yc + ph / 2.0 + gap), ring(yc - ph / 2.0 - gap)];
+						if !rim {
+							// handle bead: small wire ball on the lower ring under the gap, brighter when a hand is near
+							let bc: Color = match state {
+								2 => rgba_linear!(0.6, 0.85, 1.0, 0.95),
+								1 => rgba_linear!(0.85, 0.9, 1.0, 0.8),
+								_ => rgba_linear!(0.6, 0.65, 0.75, 0.45),
+							};
+							let br = 0.012;
+							let circle = |axis: u8| Line {
+								points: (0..20)
+									.map(|k| {
+										let a = k as f32 / 20.0 * 2.0 * PI;
+										let (s, c) = (br * a.sin(), br * a.cos());
+										let o = match axis { 0 => vec3(s, c, 0.0), 1 => vec3(0.0, c, s), _ => vec3(s, 0.0, c) };
+										LinePoint { point: (bead + o).into(), thickness: 0.003, color: bc }
+									})
+									.collect(),
+								cyclic: true,
+							};
+							ls.extend([circle(0), circle(1), circle(2)]);
+						}
 						let _ = lines.set_lines(ls);
 					}
 				}
