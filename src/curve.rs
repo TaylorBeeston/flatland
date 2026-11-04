@@ -46,7 +46,27 @@ pub fn curve() -> Option<Curve> {
 	})
 }
 
+static LIVE_RADIUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// quantize to 2 cm so a radius drag doesn't rebuild the mesh every frame
+pub fn quantize_radius(r: f32) -> f32 {
+	((r * 50.0).round() / 50.0).max(0.02)
+}
+/// set by placement whenever the group radius (adjust radius_m) changes
+pub fn set_live_radius(r: f32) {
+	LIVE_RADIUS.store(r.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
 impl Curve {
+	/// current cylinder radius (live adjust if placed, else env radius)
+	pub fn live_radius(&self) -> f32 {
+		let v = f32::from_bits(LIVE_RADIUS.load(std::sync::atomic::Ordering::Relaxed));
+		if v > 0.0 { v } else { self.radius }
+	}
+	/// same layout on radius `r`: arc position (yaw * radius) is kept, so the gaps between panels stay
+	/// constant in metres and the mesh bends to `r`.
+	pub fn on_radius(&self, r: f32) -> Curve {
+		Curve { radius: r, yaw: self.yaw * self.radius / r, anchor: self.anchor }
+	}
 	/// Panel centre pose in the anchor frame (-Z forward, +Y up).
 	pub fn local_pose(&self) -> (Vec3, Quat) {
 		let (s, c) = self.yaw.sin_cos();

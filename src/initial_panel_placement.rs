@@ -210,6 +210,8 @@ struct Adjust {
 	height_m: f32,
 	radius_m: f32,
 }
+/// below this the eDP|gap|Meta set (2.83 m of arc) would wrap past 360 deg
+const MIN_R: f32 = 0.5;
 fn read_adjust() -> Adjust {
 	let mut a = Adjust::default();
 	let Ok(body) = std::fs::read_to_string(run_dir().join("adjust")) else { return a };
@@ -222,7 +224,7 @@ fn read_adjust() -> Adjust {
 		match k {
 			"yaw_deg" => a.yaw_deg = v.clamp(-180.0, 180.0),
 			"height_m" => a.height_m = v.clamp(-1.5, 1.5),
-			"radius_m" => a.radius_m = if v == 0.0 { 0.0 } else { v.clamp(0.3, 5.0) },
+			"radius_m" => a.radius_m = if v == 0.0 { 0.0 } else { v.clamp(MIN_R, 5.0) },
 			_ => {}
 		}
 	}
@@ -237,11 +239,10 @@ async fn curved_placement(
 	req: Option<SystemTime>,
 ) -> Result<()> {
 	let adj = read_adjust();
-	let (mut local_pos, local_rot) = curve.local_pose();
-	if adj.radius_m > 0.0 {
-		// mesh keeps its baked curvature; only the distance changes
-		local_pos *= adj.radius_m / curve.radius;
-	}
+	let r = crate::curve::quantize_radius(if adj.radius_m > 0.0 { adj.radius_m } else { curve.radius });
+	crate::curve::set_live_radius(r);
+	let live = curve.on_radius(r);
+	let (local_pos, local_rot) = live.local_pose();
 	let yq = Quat::from_rotation_y(-adj.yaw_deg.to_radians());
 	let (local_pos, local_rot) = (yq * local_pos + Vec3::Y * adj.height_m, yq * local_rot);
 	match curve.anchor {
@@ -260,7 +261,7 @@ async fn curved_placement(
 				frame.clone(),
 				Transform::from_translation_rotation(head.pos + q * local_pos, q * local_rot),
 			)?;
-			info!(?curve, ?head, ?adj, "placed curved panel");
+			info!(?live, ?head, ?adj, "placed curved panel");
 		}
 	}
 	Ok(())
@@ -397,8 +398,9 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 				let Some(head) = read_anchor(None) else { continue };
 				let adj = read_adjust();
 				let r = if adj.radius_m > 0.0 { adj.radius_m } else { curve.radius };
-				let centre_az = world_az(head.yaw, curve.yaw + adj.yaw_deg.to_radians());
-				let half_az = pw / 2.0 / curve.radius; // mesh keeps baked curvature
+				let r = crate::curve::quantize_radius(r);
+				let centre_az = world_az(head.yaw, curve.on_radius(r).yaw + adj.yaw_deg.to_radians());
+				let half_az = pw / 2.0 / r;
 				let yc = head.pos.y + adj.height_m;
 				let on_edge = |p: Vec3| {
 					let (az, d) = polar(head.pos, p);
@@ -437,7 +439,7 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 						pending = Some(Adjust {
 							yaw_deg: wrap((a0.yaw_deg.to_radians()) + wrap(az - az0)).to_degrees(),
 							height_m: (a0.height_m + (p.y - p0.y)).clamp(-1.5, 1.5),
-							radius_m: (base + (d - d0)).clamp(0.3, 5.0),
+							radius_m: (base + (d - d0)).clamp(MIN_R, 5.0),
 						});
 					}
 					(None, Some(_)) => {

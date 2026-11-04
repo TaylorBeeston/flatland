@@ -70,7 +70,7 @@ impl Surfaces<'_> {
 		let curved = (visuals && self.shell.is_some() && id == SurfaceId::Toplevel)
 			.then(crate::curve::curve)
 			.flatten()
-			.and_then(|c| crate::curve::curved_panel_glb(size.x, size.y, c.radius));
+			.and_then(|c| crate::curve::curved_panel_glb(size.x, size.y, c.live_radius()));
 
 		Entity::new(Shape::Box { size: scl.into() })
 			.pos(pos)
