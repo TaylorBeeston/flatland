@@ -310,6 +310,9 @@ impl<State: ValidState> CustomElement<State> for InitialPanelPlacement {
 			match curved_placement(&ctx.stardust_client, &info.child_space, curve, req).await {
 				Ok(()) => {
 					spawn_recenter_watch(ctx.stardust_client.clone(), info.child_space.clone(), curve, req);
+					if curve.anchor.is_none() && env::var("FLATLAND_GROUP_HANDLE").is_ok_and(|v| v == "1") {
+						spawn_group_handle(ctx.stardust_client.clone(), curve);
+					}
 					return Ok(());
 				}
 				Err(e) => tracing::warn!("curved placement failed ({e:?}); falling back"),
@@ -319,4 +322,161 @@ impl<State: ValidState> CustomElement<State> for InitialPanelPlacement {
 	}
 
 	fn diff(&self, _old_self: &Self, _ctx: &Context, _inner: &mut Self::Inner) {}
+}
+
+fn write_adjust(a: Adjust) {
+	let dir = run_dir();
+	let tmp = dir.join(format!("adjust.{}", std::process::id()));
+	let body = format!(
+		"yaw_deg {:.3}\nheight_m {:.3}\nradius_m {:.3}\n",
+		a.yaw_deg, a.height_m, a.radius_m
+	);
+	if std::fs::write(&tmp, body).is_ok() {
+		let _ = std::fs::rename(&tmp, dir.join("adjust"));
+	}
+}
+
+/// Rest pose of the group grab handle in `frame`: centre of the set, below eye level, a bit closer than the panels.
+fn handle_rest(head: HeadPose, adj: Adjust, base_r: f32) -> Vec3 {
+	let r = if adj.radius_m > 0.0 { adj.radius_m } else { base_r };
+	let drop = env::var("FLATLAND_GROUP_HANDLE_DROP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.42f32);
+	let local = Quat::from_rotation_y(-adj.yaw_deg.to_radians()) * vec3(0.0, 0.0, -r * 0.8)
+		+ Vec3::Y * (adj.height_m - drop);
+	head.pos + Quat::from_rotation_y(head.yaw) * local
+}
+/// horizontal azimuth (+ = right, matching yaw_deg) and distance of `p` around the head anchor
+fn polar(head: Vec3, p: Vec3) -> (f32, f32) {
+	let d = p - head;
+	(d.x.atan2(-d.z), (d.x * d.x + d.z * d.z).sqrt())
+}
+
+/// One grab handle (orange sphere) for the whole curved set. Grab with controller grip or hand pinch and drag:
+/// left/right around you = yaw, up/down = height, toward/away = radius. Writes `adjust`, which every curved
+/// Flatland (this one included) already polls, so both panels move together.
+fn spawn_group_handle<H: ClientHandler + Send + Sync + 'static>(
+	client: Arc<Client<H>>,
+	curve: crate::curve::Curve,
+) {
+	use stardust_xr_fusion::{
+		drawable::{MaterialParameter, Model, ModelExt as _},
+		fields::{Field, FieldExt as _, Shape},
+		spatial::SpatialExt as _,
+		suis::InputDataType,
+		types::{Resource, rgba_linear},
+	};
+	use stardust_xr_molecules::input_action::{InputQueue, SingleAction};
+	const R: f32 = 0.03;
+	tokio::spawn(async move {
+		let res: Result<()> = async {
+			let frame = reference_frame(&client).await;
+			let (spatial, _) = Spatial::new(&client, &frame, Transform::IDENTITY).await?;
+			let model = Model::new(
+				&client,
+				&spatial,
+				Resource::Namespaced { namespace: <crate::Flatland as stardust_xr_asteroids::ClientState>::APP_ID.into(), path: "resize_handle".into() },
+			)
+			.await?;
+			let sphere = model.get_part("sphere").await?;
+			let set_color = |c| {
+				if let Some(s) = sphere.clone() {
+					tokio::spawn(async move {
+						let _ = s.set_material_parameter("color", MaterialParameter::Color { value: c }).await;
+					});
+				}
+			};
+			let idle = rgba_linear!(1.0, 0.45, 0.05, 1.0);
+			set_color(idle);
+			let (field, _) = Field::new(&client, &spatial, Shape::Sphere { radius: R }).await?;
+			let input = InputQueue::new(&client, spatial.clone(), field.clone(), frame.clone()).await?;
+			let mut action = SingleAction::default();
+			let scale = env::var("FLATLAND_GROUP_HANDLE_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(6.0f32);
+			let place = |p: Vec3| {
+				let _ = spatial.set_relative_transform(
+					frame.clone(),
+					Transform::from_translation_scale(p, [scale; 3]),
+				);
+			};
+			// grab start: (grab point, adjust)
+			let mut start: Option<(Vec3, Adjust)> = None;
+			let mut last_write = Instant::now();
+			let mut pending: Option<Adjust> = None;
+			let mut rest = Vec3::ZERO;
+			let mut hovered = false;
+			info!("group grab handle ready");
+			loop {
+				tokio::time::sleep(Duration::from_millis(16)).await;
+				let Some(head) = read_anchor(None) else { continue };
+				let _ = input.handle_events();
+				action.update(
+					true,
+					&input,
+					|i| match i.input() {
+						InputDataType::Pointer { .. } => false,
+						_ => i.distance() < R + 0.05,
+					},
+					|i| match i.input() {
+						InputDataType::Hand { .. } => i.datamap_f32("pinch_strength") > 0.90,
+						_ => i.datamap_f32("grab") > 0.90,
+					},
+				);
+				let h = !action.hovering().current().is_empty() || action.actor_acting();
+				if h != hovered {
+					hovered = h;
+					set_color(if h { rgba_linear!(1.0, 0.85, 0.3, 1.0) } else { idle });
+				}
+				let point = action.actor().and_then(|a| match a.input() {
+					InputDataType::Hand { data } => Some(
+						Vec3::from(data.thumb.tip.pose.position)
+							.lerp(Vec3::from(data.index.tip.pose.position), 0.5),
+					),
+					InputDataType::Tip { data } => Some(Vec3::from(data.pose.position)),
+					InputDataType::Pointer { .. } => None,
+				});
+				match (point, start) {
+					(Some(p), None) => {
+						start = Some((p, read_adjust()));
+						info!("group handle grabbed");
+					}
+					(Some(p), Some((p0, a0))) => {
+						let (az0, d0) = polar(head.pos, p0);
+						let (az, d) = polar(head.pos, p);
+						let base = if a0.radius_m > 0.0 { a0.radius_m } else { curve.radius };
+						let a = Adjust {
+							yaw_deg: (a0.yaw_deg + wrap(az - az0).to_degrees()).clamp(-180.0, 180.0),
+							height_m: (a0.height_m + (p.y - p0.y)).clamp(-1.5, 1.5),
+							radius_m: (base + (d - d0) * 1.5).clamp(0.3, 5.0),
+						};
+						pending = Some(a);
+						place(p);
+					}
+					(None, Some(_)) => {
+						start = None;
+						if let Some(a) = pending.take() {
+							write_adjust(a);
+						}
+						info!(adjust = ?read_adjust(), "group handle released");
+					}
+					(None, None) => {}
+				}
+				if let Some(a) = pending {
+					if last_write.elapsed() >= Duration::from_millis(100) {
+						write_adjust(a);
+						pending = None;
+						last_write = Instant::now();
+					}
+				}
+				if start.is_none() {
+					let r = handle_rest(head, read_adjust(), curve.radius);
+					if r.distance(rest) > 0.002 {
+						rest = r;
+						place(r);
+					}
+				}
+			}
+		}
+		.await;
+		if let Err(e) = res {
+			tracing::warn!("group grab handle failed: {e:?}");
+		}
+	});
 }
