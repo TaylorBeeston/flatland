@@ -46,10 +46,11 @@ pub fn curve() -> Option<Curve> {
 	})
 }
 
-/// FLATLAND_CURVE_BEND: mesh bends `bend`x tighter than the cylinder radius (1 = exactly on it).
-/// From the cylinder centre a true concentric panel reads almost flat, so the shell sets >1.
+/// Mesh bend factor. Always 1: the panel mesh is baked at exactly the cylinder radius, so every panel
+/// lies on the same cylinder the wireframe rings draw (axis at the head anchor). A tighter bend (>1) made
+/// the panels diverge from the rings; FLATLAND_CURVE_BEND is now ignored on purpose.
 pub fn bend() -> f32 {
-	std::env::var("FLATLAND_CURVE_BEND").ok().and_then(|v| v.parse().ok()).filter(|v: &f32| v.is_finite()).unwrap_or(1.0).clamp(1.0, 3.0)
+	1.0
 }
 /// radius the mesh is baked at for a `w` m panel on cylinder `r` (arc capped at 175 deg)
 pub fn mesh_radius(w: f32, r: f32) -> f32 {
