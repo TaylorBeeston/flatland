@@ -209,6 +209,8 @@ struct Adjust {
 	yaw_deg: f32,
 	height_m: f32,
 	radius_m: f32,
+	/// 1 while the group handle is held: placement follows the radius but the mesh is not rebaked
+	dragging: bool,
 }
 /// below this the eDP|gap|Meta set (2.83 m of arc) would wrap past 360 deg
 const MIN_R: f32 = 0.5;
@@ -225,6 +227,7 @@ fn read_adjust() -> Adjust {
 			"yaw_deg" => a.yaw_deg = v.clamp(-180.0, 180.0),
 			"height_m" => a.height_m = v.clamp(-1.5, 1.5),
 			"radius_m" => a.radius_m = if v == 0.0 { 0.0 } else { v.clamp(MIN_R, 5.0) },
+			"dragging" => a.dragging = v != 0.0,
 			_ => {}
 		}
 	}
@@ -237,10 +240,22 @@ async fn curved_placement(
 	spatial_root: &Spatial,
 	curve: crate::curve::Curve,
 	req: Option<SystemTime>,
+	force_bake: bool,
 ) -> Result<()> {
 	let adj = read_adjust();
 	let r = crate::curve::quantize_radius(if adj.radius_m > 0.0 { adj.radius_m } else { curve.radius });
 	crate::curve::set_live_radius(r);
+	// bake on release: while the handle is held keep the current mesh (no per-2cm GLB load in the
+	// server); on release / CLI set / settle swap to one mesh at the final radius. The surfaces
+	// render keys the SurfaceModel by GLB path, so the old model node is destroyed on swap.
+	if !adj.dragging || force_bake {
+		let old = crate::curve::bake_radius_raw();
+		if crate::curve::set_bake_radius(r) {
+			info!(from = old, to = r, force_bake, "curve mesh bake: swap to final radius (old model dropped)");
+		}
+	} else {
+		tracing::debug!(r, "radius drag: placement only, mesh bake deferred to release");
+	}
 	let pw = panel_size_m().map(|p| p.0).unwrap_or(1.0);
 	let live = curve.on_radius(r, pw);
 	let mesh_r = crate::curve::mesh_radius(pw, r);
@@ -280,17 +295,32 @@ fn spawn_recenter_watch<H: ClientHandler + Send + Sync + 'static>(
 		let req_path = run_dir().join("recenter.req");
 		let adj_path = run_dir().join("adjust");
 		let mut last_adj = mtime(&adj_path);
+		let mut last_change = Instant::now();
 		loop {
 			tokio::time::sleep(Duration::from_millis(200)).await;
 			let t = mtime(&req_path);
 			let ta = mtime(&adj_path);
+			if ta != last_adj {
+				last_change = Instant::now();
+			}
+			// a drag whose release never got written (owner died): bake once after 2 s of no adjust change
+			if ta == last_adj
+				&& last_change.elapsed() > Duration::from_secs(2)
+				&& read_adjust().dragging
+				&& crate::curve::bake_radius_raw() != crate::curve::live_radius_raw()
+			{
+				info!("adjust still says dragging after 2 s idle; baking anyway");
+				if let Err(e) = curved_placement(&client, &spatial_root, curve, last, true).await {
+					tracing::warn!("settle bake failed: {e:?}");
+				}
+			}
 			if (t.is_some() && t != last) || ta != last_adj {
 				// adjust-only change reuses the current anchor (same `last` => no new head sample)
 				let req = if t != last { t } else { last };
 				last = t;
 				last_adj = ta;
 				info!("recenter/adjust requested");
-				if let Err(e) = curved_placement(&client, &spatial_root, curve, req).await {
+				if let Err(e) = curved_placement(&client, &spatial_root, curve, req, false).await {
 					tracing::warn!("recenter failed: {e:?}");
 				}
 			}
@@ -310,7 +340,7 @@ impl<State: ValidState> CustomElement<State> for InitialPanelPlacement {
 		if let Some(curve) = self.curve {
 			let _ = std::fs::create_dir_all(run_dir());
 			let req = mtime(&run_dir().join("recenter.req"));
-			match curved_placement(&ctx.stardust_client, &info.child_space, curve, req).await {
+			match curved_placement(&ctx.stardust_client, &info.child_space, curve, req, true).await {
 				Ok(()) => {
 					spawn_recenter_watch(ctx.stardust_client.clone(), info.child_space.clone(), curve, req);
 					// one Flatland owns the group grab (the handle bead or, opt-in, the rim) + wire rings
@@ -334,8 +364,8 @@ fn write_adjust(a: Adjust) {
 	let dir = run_dir();
 	let tmp = dir.join(format!("adjust.{}", std::process::id()));
 	let body = format!(
-		"yaw_deg {:.3}\nheight_m {:.3}\nradius_m {:.3}\n",
-		a.yaw_deg, a.height_m, a.radius_m
+		"yaw_deg {:.3}\nheight_m {:.3}\nradius_m {:.3}\ndragging {}\n",
+		a.yaw_deg, a.height_m, a.radius_m, a.dragging as u8
 	);
 	if std::fs::write(&tmp, body).is_ok() {
 		let _ = std::fs::rename(&tmp, dir.join("adjust"));
@@ -476,6 +506,7 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 							yaw_deg: wrap((a0.yaw_deg.to_radians()) + wrap(az - az0)).to_degrees(),
 							height_m: (a0.height_m + (p.y - p0.y)).clamp(-1.5, 1.5),
 							radius_m: (base + (d - d0)).clamp(MIN_R, 5.0),
+							dragging: true,
 						});
 					}
 					(None, Some(_)) => {
@@ -491,7 +522,8 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 								}
 							}
 						}
-						let a = pending.take().unwrap_or_else(read_adjust);
+						let mut a = pending.take().unwrap_or_else(read_adjust);
+						a.dragging = false;
 						write_adjust(a);
 						info!(adjust = ?read_adjust(), "cylinder edge released");
 					}

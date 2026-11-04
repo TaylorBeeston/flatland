@@ -71,11 +71,29 @@ pub fn quantize_radius(r: f32) -> f32 {
 pub fn set_live_radius(r: f32) {
 	LIVE_RADIUS.store(r.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
+/// radius the panel mesh is baked at. Only moves when a radius drag is released (or a non-drag adjust
+/// settles), so a drag never loads a new GLB per 2 cm quantum into the server.
+static BAKE_RADIUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// returns true if the bake radius changed (=> one new mesh + the old SurfaceModel dropped)
+pub fn set_bake_radius(r: f32) -> bool {
+	BAKE_RADIUS.swap(r.to_bits(), std::sync::atomic::Ordering::Relaxed) != r.to_bits()
+}
+pub fn live_radius_raw() -> f32 {
+	f32::from_bits(LIVE_RADIUS.load(std::sync::atomic::Ordering::Relaxed))
+}
+pub fn bake_radius_raw() -> f32 {
+	f32::from_bits(BAKE_RADIUS.load(std::sync::atomic::Ordering::Relaxed))
+}
 
 impl Curve {
 	/// current cylinder radius (live adjust if placed, else env radius)
 	pub fn live_radius(&self) -> f32 {
 		let v = f32::from_bits(LIVE_RADIUS.load(std::sync::atomic::Ordering::Relaxed));
+		if v > 0.0 { v } else { self.radius }
+	}
+	/// radius the mesh is (to be) baked at: last released radius, else the env radius
+	pub fn bake_radius(&self) -> f32 {
+		let v = bake_radius_raw();
 		if v > 0.0 { v } else { self.radius }
 	}
 	/// same layout on radius `r` for a panel `w` m wide: the panel's inner edge (the one facing the gap)
@@ -177,7 +195,35 @@ pub fn curved_panel_glb(width: f32, height: f32, radius: f32) -> Option<PathBuf>
 	std::fs::write(&tmp, out).ok()?;
 	std::fs::rename(&tmp, &path).ok()?;
 	tracing::info!(?path, segs, "wrote curved panel mesh");
+	prune_glb_cache(&dir, &path);
 	Some(path)
+}
+
+/// keep the GLB cache small: drop curve3-*.glb older than 10 min beyond the newest 12 (never `keep`).
+/// The server already holds whatever it loaded, so deleting a file can't break a live model.
+fn prune_glb_cache(dir: &std::path::Path, keep: &std::path::Path) {
+	let Ok(rd) = std::fs::read_dir(dir) else { return };
+	let mut glbs: Vec<(std::time::SystemTime, PathBuf)> = rd
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| {
+			p != keep
+				&& p.extension().is_some_and(|e| e == "glb")
+				&& p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("curve"))
+		})
+		.filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+		.collect();
+	glbs.sort_by(|a, b| b.0.cmp(&a.0));
+	let now = std::time::SystemTime::now();
+	let mut removed = 0;
+	for (t, p) in glbs.into_iter().skip(12) {
+		if now.duration_since(t).is_ok_and(|d| d.as_secs() > 600) && std::fs::remove_file(&p).is_ok() {
+			removed += 1;
+		}
+	}
+	if removed > 0 {
+		tracing::info!(removed, "pruned stale curve GLBs");
+	}
 }
 
 /// $XDG_RUNTIME_DIR/flatland-curve: meshes, shared head anchor, recenter request.
