@@ -310,8 +310,8 @@ impl<State: ValidState> CustomElement<State> for InitialPanelPlacement {
 			match curved_placement(&ctx.stardust_client, &info.child_space, curve, req).await {
 				Ok(()) => {
 					spawn_recenter_watch(ctx.stardust_client.clone(), info.child_space.clone(), curve, req);
-					if curve.anchor.is_none() && env::var("FLATLAND_GROUP_HANDLE").is_ok_and(|v| v == "1") {
-						spawn_group_handle(ctx.stardust_client.clone(), curve);
+					if curve.anchor.is_none() && !env::var("FLATLAND_EDGE_GRAB").is_ok_and(|v| v == "0") {
+						spawn_edge_grab(ctx.stardust_client.clone(), curve);
 					}
 					return Ok(());
 				}
@@ -336,125 +336,116 @@ fn write_adjust(a: Adjust) {
 	}
 }
 
-/// Rest pose of the group grab handle in `frame`: centre of the set, below eye level, a bit closer than the panels.
-fn handle_rest(head: HeadPose, adj: Adjust, base_r: f32) -> Vec3 {
-	let r = if adj.radius_m > 0.0 { adj.radius_m } else { base_r };
-	let drop = env::var("FLATLAND_GROUP_HANDLE_DROP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.42f32);
-	let local = Quat::from_rotation_y(-adj.yaw_deg.to_radians()) * vec3(0.0, 0.0, -r * 0.8)
-		+ Vec3::Y * (adj.height_m - drop);
-	head.pos + Quat::from_rotation_y(head.yaw) * local
-}
 /// horizontal azimuth (+ = right, matching yaw_deg) and distance of `p` around the head anchor
 fn polar(head: Vec3, p: Vec3) -> (f32, f32) {
 	let d = p - head;
 	(d.x.atan2(-d.z), (d.x * d.x + d.z * d.z).sqrt())
 }
+/// azimuth (in `frame`, same convention as `polar`) of local yaw `y` after the head yaw `hy`
+fn world_az(hy: f32, local_yaw: f32) -> f32 {
+	let f = Quat::from_rotation_y(hy) * Quat::from_rotation_y(-local_yaw) * Vec3::NEG_Z;
+	f.x.atan2(-f.z)
+}
 
-/// One grab handle (orange sphere) for the whole curved set. Grab with controller grip or hand pinch and drag:
-/// left/right around you = yaw, up/down = height, toward/away = radius. Writes `adjust`, which every curved
-/// Flatland (this one included) already polls, so both panels move together.
-fn spawn_group_handle<H: ClientHandler + Send + Sync + 'static>(
+/// panel size in m from FLATLAND_FIXED_RES / FLATLAND_DENSITY (what snap_fixed_size uses)
+fn panel_size_m() -> Option<(f32, f32)> {
+	let res = env::var("FLATLAND_FIXED_RES").ok()?;
+	let (w, h) = res.split_once('x')?;
+	let d: f32 = env::var("FLATLAND_DENSITY").ok()?.parse().ok()?;
+	Some((w.parse::<f32>().ok()? / d, h.parse::<f32>().ok()? / d))
+}
+
+/// Edge grab: grip/pinch within EDGE m of this panel's rim (angular left/right edges, top/bottom) and drag to
+/// move the whole cylinder: around you = yaw, up/down = height, toward/away = radius. Writes the shared
+/// `adjust` file that every curved Flatland polls, so all panels move rigidly and never overlap.
+/// With FLATLAND_CYLINDER_WIRE=1 this Flatland also draws a faint cylinder wireframe (one panel should).
+fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 	client: Arc<Client<H>>,
 	curve: crate::curve::Curve,
 ) {
 	use stardust_xr_fusion::{
-		drawable::{MaterialParameter, Model, ModelExt as _},
+		drawable::{Line, LinePoint, Lines, LinesExt as _},
 		fields::{Field, FieldExt as _, Shape},
 		spatial::SpatialExt as _,
 		suis::InputDataType,
-		types::{Resource, rgba_linear},
+		types::{Color, rgba_linear},
 	};
 	use stardust_xr_molecules::input_action::{InputQueue, SingleAction};
-	const R: f32 = 0.03;
+	let Some((pw, ph)) = panel_size_m() else {
+		tracing::warn!("edge grab: no FLATLAND_FIXED_RES/DENSITY, disabled");
+		return;
+	};
+	let edge: f32 = env::var("FLATLAND_EDGE_GRAB_M").ok().and_then(|v| v.parse().ok()).unwrap_or(0.07);
+	let wire = env::var("FLATLAND_CYLINDER_WIRE").is_ok_and(|v| v == "1");
 	tokio::spawn(async move {
 		let res: Result<()> = async {
 			let frame = reference_frame(&client).await;
 			let (spatial, _) = Spatial::new(&client, &frame, Transform::IDENTITY).await?;
-			let model = Model::new(
-				&client,
-				&spatial,
-				Resource::Namespaced { namespace: <crate::Flatland as stardust_xr_asteroids::ClientState>::APP_ID.into(), path: "resize_handle".into() },
-			)
-			.await?;
-			let sphere = model.get_part("sphere").await?;
-			let set_color = |c| {
-				if let Some(s) = sphere.clone() {
-					tokio::spawn(async move {
-						let _ = s.set_material_parameter("color", MaterialParameter::Color { value: c }).await;
-					});
-				}
-			};
-			let idle = rgba_linear!(1.0, 0.45, 0.05, 1.0);
-			set_color(idle);
-			let (field, _) = Field::new(&client, &spatial, Shape::Sphere { radius: R }).await?;
+			// big sphere around the head: every hand/controller near the cylinder reaches the queue,
+			// the edge test below decides what counts
+			let (field, _) = Field::new(&client, &spatial, Shape::Sphere { radius: 6.0 }).await?;
 			let input = InputQueue::new(&client, spatial.clone(), field.clone(), frame.clone()).await?;
+			let lines = if wire { Some(Lines::new(&client, &spatial, Vec::new()).await?) } else { None };
 			let mut action = SingleAction::default();
-			let scale = env::var("FLATLAND_GROUP_HANDLE_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(6.0f32);
-			let place = |p: Vec3| {
-				let _ = spatial.set_relative_transform(
-					frame.clone(),
-					Transform::from_translation_scale(p, [scale; 3]),
-				);
-			};
-			// grab start: (grab point, adjust)
 			let mut start: Option<(Vec3, Adjust)> = None;
-			let mut last_write = Instant::now();
 			let mut pending: Option<Adjust> = None;
-			let mut rest = Vec3::ZERO;
-			let mut hovered = false;
-			info!("group grab handle ready");
+			let mut last_write = Instant::now();
+			let mut drawn: Option<(Vec3, f32, f32, f32, bool)> = None;
+			info!(pw, ph, edge, wire, "edge grab ready");
 			loop {
 				tokio::time::sleep(Duration::from_millis(16)).await;
 				let Some(head) = read_anchor(None) else { continue };
+				let adj = read_adjust();
+				let r = if adj.radius_m > 0.0 { adj.radius_m } else { curve.radius };
+				let centre_az = world_az(head.yaw, curve.yaw + adj.yaw_deg.to_radians());
+				let half_az = pw / 2.0 / curve.radius; // mesh keeps baked curvature
+				let yc = head.pos.y + adj.height_m;
+				let on_edge = |p: Vec3| {
+					let (az, d) = polar(head.pos, p);
+					let daz = wrap(az - centre_az).abs();
+					let dy = (p.y - yc).abs();
+					let near = (d - r).abs() < 0.15 && daz < half_az + edge / r && dy < ph / 2.0 + edge;
+					near && (daz > half_az - edge / r || dy > ph / 2.0 - edge)
+				};
+				let point = |i: &stardust_xr_molecules::input_action::InputSnapshot| match i.input() {
+					InputDataType::Hand { data } => Some(
+						Vec3::from(data.thumb.tip.pose.position).lerp(Vec3::from(data.index.tip.pose.position), 0.5),
+					),
+					InputDataType::Tip { data } => Some(Vec3::from(data.pose.position)),
+					InputDataType::Pointer { .. } => None,
+				};
 				let _ = input.handle_events();
 				action.update(
 					true,
 					&input,
-					|i| match i.input() {
-						InputDataType::Pointer { .. } => false,
-						_ => i.distance() < R + 0.05,
-					},
+					|i| point(i).is_some_and(|p| on_edge(p)),
 					|i| match i.input() {
 						InputDataType::Hand { .. } => i.datamap_f32("pinch_strength") > 0.90,
 						_ => i.datamap_f32("grab") > 0.90,
 					},
 				);
-				let h = !action.hovering().current().is_empty() || action.actor_acting();
-				if h != hovered {
-					hovered = h;
-					set_color(if h { rgba_linear!(1.0, 0.85, 0.3, 1.0) } else { idle });
-				}
-				let point = action.actor().and_then(|a| match a.input() {
-					InputDataType::Hand { data } => Some(
-						Vec3::from(data.thumb.tip.pose.position)
-							.lerp(Vec3::from(data.index.tip.pose.position), 0.5),
-					),
-					InputDataType::Tip { data } => Some(Vec3::from(data.pose.position)),
-					InputDataType::Pointer { .. } => None,
-				});
-				match (point, start) {
+				let p = action.actor().and_then(|a| point(a));
+				match (p, start) {
 					(Some(p), None) => {
-						start = Some((p, read_adjust()));
-						info!("group handle grabbed");
+						start = Some((p, adj));
+						info!("cylinder edge grabbed");
 					}
 					(Some(p), Some((p0, a0))) => {
 						let (az0, d0) = polar(head.pos, p0);
 						let (az, d) = polar(head.pos, p);
 						let base = if a0.radius_m > 0.0 { a0.radius_m } else { curve.radius };
-						let a = Adjust {
-							yaw_deg: (a0.yaw_deg + wrap(az - az0).to_degrees()).clamp(-180.0, 180.0),
+						pending = Some(Adjust {
+							yaw_deg: wrap((a0.yaw_deg.to_radians()) + wrap(az - az0)).to_degrees(),
 							height_m: (a0.height_m + (p.y - p0.y)).clamp(-1.5, 1.5),
-							radius_m: (base + (d - d0) * 1.5).clamp(0.3, 5.0),
-						};
-						pending = Some(a);
-						place(p);
+							radius_m: (base + (d - d0)).clamp(0.3, 5.0),
+						});
 					}
 					(None, Some(_)) => {
 						start = None;
 						if let Some(a) = pending.take() {
 							write_adjust(a);
 						}
-						info!(adjust = ?read_adjust(), "group handle released");
+						info!(adjust = ?read_adjust(), "cylinder edge released");
 					}
 					(None, None) => {}
 				}
@@ -465,18 +456,37 @@ fn spawn_group_handle<H: ClientHandler + Send + Sync + 'static>(
 						last_write = Instant::now();
 					}
 				}
-				if start.is_none() {
-					let r = handle_rest(head, read_adjust(), curve.radius);
-					if r.distance(rest) > 0.002 {
-						rest = r;
-						place(r);
+				if let Some(lines) = &lines {
+					let hot = start.is_some();
+					let key = (head.pos, head.yaw, r, yc, hot);
+					if drawn != Some(key) {
+						drawn = Some(key);
+						let col: Color = if hot { rgba_linear!(0.5, 0.7, 1.0, 0.6) } else { rgba_linear!(0.35, 0.45, 0.6, 0.18) };
+						let th = 0.0015;
+						let lp = |v: Vec3| LinePoint { point: v.into(), thickness: th, color: col };
+						let ring = |y: f32| Line {
+							points: (0..96)
+								.map(|k| {
+									let a = k as f32 / 96.0 * 2.0 * PI;
+									lp(vec3(head.pos.x + r * a.sin(), y, head.pos.z - r * a.cos()))
+								})
+								.collect(),
+							cyclic: true,
+						};
+						let mut ls = vec![ring(yc + ph / 2.0), ring(yc - ph / 2.0)];
+						for k in 0..24 {
+							let a = k as f32 / 24.0 * 2.0 * PI;
+							let (x, z) = (head.pos.x + r * a.sin(), head.pos.z - r * a.cos());
+							ls.push(Line { points: vec![lp(vec3(x, yc - ph / 2.0, z)), lp(vec3(x, yc + ph / 2.0, z))], cyclic: false });
+						}
+						let _ = lines.set_lines(ls);
 					}
 				}
 			}
 		}
 		.await;
 		if let Err(e) = res {
-			tracing::warn!("group grab handle failed: {e:?}");
+			tracing::warn!("edge grab failed: {e:?}");
 		}
 	});
 }
