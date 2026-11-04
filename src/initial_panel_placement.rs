@@ -403,6 +403,7 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 			let mut last_write = Instant::now();
 			let mut drawn: Option<(Vec3, f32, f32, f32, f32, u8)> = None;
 			let hmd = Tracked::hmd_spatial().await.ok();
+			let reanchor = !env::var("FLATLAND_REANCHOR_ON_RELEASE").is_ok_and(|v| v == "0");
 			let mut last_axis_log = Instant::now() - Duration::from_secs(60);
 			info!(pw, ph, edge, rim, bead_r, bead_arc, wire, "group grab ready");
 			loop {
@@ -465,7 +466,7 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 				match (p, start) {
 					(Some(p), None) => {
 						start = Some((p, adj));
-						info!("cylinder edge grabbed");
+						info!(rim, "cylinder group grabbed");
 					}
 					(Some(p), Some((p0, a0))) => {
 						let (az0, d0) = polar(head.pos, p0);
@@ -479,9 +480,19 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 					}
 					(None, Some(_)) => {
 						start = None;
-						if let Some(a) = pending.take() {
-							write_adjust(a);
+						// re-centre the axis on where the head is now (x/z only; yaw + eye height kept), so after
+						// dialing you sit on the cylinder axis. FLATLAND_REANCHOR_ON_RELEASE=0 disables.
+						if reanchor {
+							if let Some(hmd) = &hmd {
+								if let Ok(h) = hmd_in(&client, &frame, hmd).await {
+									let moved = vec3(h.pos.x - head.pos.x, 0.0, h.pos.z - head.pos.z).length();
+									write_anchor(HeadPose { pos: vec3(h.pos.x, head.pos.y, h.pos.z), yaw: head.yaw });
+									info!(moved_cm = moved * 100.0, "re-anchored axis at head on release");
+								}
+							}
 						}
+						let a = pending.take().unwrap_or_else(read_adjust);
+						write_adjust(a);
 						info!(adjust = ?read_adjust(), "cylinder edge released");
 					}
 					(None, None) => {}
@@ -494,7 +505,7 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 					}
 				}
 				if let Some(lines) = &lines {
-					let near = input.input().keys().any(|i| point(i).is_some_and(|p| p.distance(bead) < bead_r * 2.5));
+					let near = input.input().values().any(|i| point(i).is_some_and(|p| p.distance(bead) < bead_r * 2.5));
 					let state: u8 = if start.is_some() { 2 } else if near { 1 } else { 0 };
 					let hot = state == 2;
 					let key = (head.pos, head.yaw, r, yc, bead_az, state);
