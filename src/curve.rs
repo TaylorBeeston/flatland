@@ -46,6 +46,21 @@ pub fn curve() -> Option<Curve> {
 	})
 }
 
+/// FLATLAND_CURVE_BEND: mesh bends `bend`x tighter than the cylinder radius (1 = exactly on it).
+/// From the cylinder centre a true concentric panel reads almost flat, so the shell sets >1.
+pub fn bend() -> f32 {
+	std::env::var("FLATLAND_CURVE_BEND").ok().and_then(|v| v.parse().ok()).filter(|v: &f32| v.is_finite()).unwrap_or(1.0).clamp(1.0, 3.0)
+}
+/// radius the mesh is baked at for a `w` m panel on cylinder `r` (arc capped at 175 deg)
+pub fn mesh_radius(w: f32, r: f32) -> f32 {
+	quantize_radius((r / bend()).max(w / 175f32.to_radians()))
+}
+/// azimuth from the cylinder centre of a panel edge, relative to the panel centre (panel centre at r)
+pub fn edge_half_az(w: f32, r: f32) -> f32 {
+	let m = mesh_radius(w, r);
+	let th = w / (2.0 * m);
+	(m * th.sin()).atan2(r - m * (1.0 - th.cos()))
+}
 static LIVE_RADIUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// quantize to 2 cm so a radius drag doesn't rebuild the mesh every frame
 pub fn quantize_radius(r: f32) -> f32 {
@@ -62,10 +77,14 @@ impl Curve {
 		let v = f32::from_bits(LIVE_RADIUS.load(std::sync::atomic::Ordering::Relaxed));
 		if v > 0.0 { v } else { self.radius }
 	}
-	/// same layout on radius `r`: arc position (yaw * radius) is kept, so the gaps between panels stay
-	/// constant in metres and the mesh bends to `r`.
-	pub fn on_radius(&self, r: f32) -> Curve {
-		Curve { radius: r, yaw: self.yaw * self.radius / r, anchor: self.anchor }
+	/// same layout on radius `r` for a panel `w` m wide: the panel's inner edge (the one facing the gap)
+	/// keeps its arc position (yaw * radius), so the gaps stay constant in metres, and the centre is set
+	/// from that edge by the bent mesh's real half-angle so tighter bends never overlap.
+	pub fn on_radius(&self, r: f32, w: f32) -> Curve {
+		let s0 = self.yaw * self.radius;
+		let sign = if s0 < 0.0 { 1.0 } else { -1.0 }; // inner edge is toward the group centre
+		let inner = (s0 + sign * w / 2.0) / r;
+		Curve { radius: r, yaw: inner - sign * edge_half_az(w, r), anchor: self.anchor }
 	}
 	/// Panel centre pose in the anchor frame (-Z forward, +Y up).
 	pub fn local_pose(&self) -> (Vec3, Quat) {

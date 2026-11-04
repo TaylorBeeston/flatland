@@ -241,7 +241,9 @@ async fn curved_placement(
 	let adj = read_adjust();
 	let r = crate::curve::quantize_radius(if adj.radius_m > 0.0 { adj.radius_m } else { curve.radius });
 	crate::curve::set_live_radius(r);
-	let live = curve.on_radius(r);
+	let pw = panel_size_m().map(|p| p.0).unwrap_or(1.0);
+	let live = curve.on_radius(r, pw);
+	let mesh_r = crate::curve::mesh_radius(pw, r);
 	let (local_pos, local_rot) = live.local_pose();
 	let yq = Quat::from_rotation_y(-adj.yaw_deg.to_radians());
 	let (local_pos, local_rot) = (yq * local_pos + Vec3::Y * adj.height_m, yq * local_rot);
@@ -261,7 +263,7 @@ async fn curved_placement(
 				frame.clone(),
 				Transform::from_translation_rotation(head.pos + q * local_pos, q * local_rot),
 			)?;
-			info!(?live, ?head, ?adj, "placed curved panel");
+			info!(?live, mesh_r, ?head, ?adj, "placed curved panel");
 		}
 	}
 	Ok(())
@@ -399,14 +401,14 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 				let adj = read_adjust();
 				let r = if adj.radius_m > 0.0 { adj.radius_m } else { curve.radius };
 				let r = crate::curve::quantize_radius(r);
-				let centre_az = world_az(head.yaw, curve.on_radius(r).yaw + adj.yaw_deg.to_radians());
-				let half_az = pw / 2.0 / r;
+				let centre_az = world_az(head.yaw, curve.on_radius(r, pw).yaw + adj.yaw_deg.to_radians());
+				let half_az = crate::curve::edge_half_az(pw, r);
 				let yc = head.pos.y + adj.height_m;
 				let on_edge = |p: Vec3| {
 					let (az, d) = polar(head.pos, p);
 					let daz = wrap(az - centre_az).abs();
 					let dy = (p.y - yc).abs();
-					let near = (d - r).abs() < 0.15 && daz < half_az + edge / r && dy < ph / 2.0 + edge;
+					let near = (d - r).abs() < 0.3 && daz < half_az + edge / r && dy < ph / 2.0 + edge;
 					near && (daz > half_az - edge / r || dy > ph / 2.0 - edge)
 				};
 				let point = |i: &stardust_xr_molecules::input_action::InputSnapshot| match i.input() {
@@ -475,12 +477,9 @@ fn spawn_edge_grab<H: ClientHandler + Send + Sync + 'static>(
 								.collect(),
 							cyclic: true,
 						};
-						let mut ls = vec![ring(yc + ph / 2.0), ring(yc - ph / 2.0)];
-						for k in 0..24 {
-							let a = k as f32 / 24.0 * 2.0 * PI;
-							let (x, z) = (head.pos.x + r * a.sin(), head.pos.z - r * a.cos());
-							ls.push(Line { points: vec![lp(vec3(x, yc - ph / 2.0, z)), lp(vec3(x, yc + ph / 2.0, z))], cyclic: false });
-						}
+						// rings only, clear of the screens (never across content)
+						let gap = 0.06;
+						let ls = vec![ring(yc + ph / 2.0 + gap), ring(yc - ph / 2.0 - gap)];
 						let _ = lines.set_lines(ls);
 					}
 				}
