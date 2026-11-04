@@ -201,6 +201,34 @@ async fn reference_frame(client: &Client<impl ClientHandler>) -> SpatialRef {
 	}
 }
 
+/// Group offset for all curved panels, from `$XDG_RUNTIME_DIR/flatland-curve/adjust`
+/// (written by `stardust-dual-mirror-recenter --yaw/--height/--radius`). Lines `key value`:
+/// `yaw_deg` (+ = rotate the set right), `height_m` (+ = up), `radius_m` (absolute; 0/absent = env radius).
+#[derive(Debug, Default, Clone, Copy)]
+struct Adjust {
+	yaw_deg: f32,
+	height_m: f32,
+	radius_m: f32,
+}
+fn read_adjust() -> Adjust {
+	let mut a = Adjust::default();
+	let Ok(body) = std::fs::read_to_string(run_dir().join("adjust")) else { return a };
+	for line in body.lines() {
+		let mut it = line.split_whitespace();
+		let (Some(k), Some(v)) = (it.next(), it.next().and_then(|v| v.parse::<f32>().ok())) else { continue };
+		if !v.is_finite() {
+			continue;
+		}
+		match k {
+			"yaw_deg" => a.yaw_deg = v.clamp(-180.0, 180.0),
+			"height_m" => a.height_m = v.clamp(-1.5, 1.5),
+			"radius_m" => a.radius_m = if v == 0.0 { 0.0 } else { v.clamp(0.3, 5.0) },
+			_ => {}
+		}
+	}
+	a
+}
+
 /// Place the panel on the WayVR-style cylinder: fixed stage anchor, or the (shared, settled) head pose.
 async fn curved_placement(
 	client: &Client<impl ClientHandler>,
@@ -208,7 +236,14 @@ async fn curved_placement(
 	curve: crate::curve::Curve,
 	req: Option<SystemTime>,
 ) -> Result<()> {
-	let (local_pos, local_rot) = curve.local_pose();
+	let adj = read_adjust();
+	let (mut local_pos, local_rot) = curve.local_pose();
+	if adj.radius_m > 0.0 {
+		// mesh keeps its baked curvature; only the distance changes
+		local_pos *= adj.radius_m / curve.radius;
+	}
+	let yq = Quat::from_rotation_y(-adj.yaw_deg.to_radians());
+	let (local_pos, local_rot) = (yq * local_pos + Vec3::Y * adj.height_m, yq * local_rot);
 	match curve.anchor {
 		Some(anchor) => {
 			let stage = Tracked::stage_spatial().await?;
@@ -225,7 +260,7 @@ async fn curved_placement(
 				frame.clone(),
 				Transform::from_translation_rotation(head.pos + q * local_pos, q * local_rot),
 			)?;
-			info!(?curve, ?head, "placed curved panel");
+			info!(?curve, ?head, ?adj, "placed curved panel");
 		}
 	}
 	Ok(())
@@ -240,13 +275,19 @@ fn spawn_recenter_watch<H: ClientHandler + Send + Sync + 'static>(
 ) {
 	tokio::spawn(async move {
 		let req_path = run_dir().join("recenter.req");
+		let adj_path = run_dir().join("adjust");
+		let mut last_adj = mtime(&adj_path);
 		loop {
 			tokio::time::sleep(Duration::from_millis(200)).await;
 			let t = mtime(&req_path);
-			if t.is_some() && t != last {
+			let ta = mtime(&adj_path);
+			if (t.is_some() && t != last) || ta != last_adj {
+				// adjust-only change reuses the current anchor (same `last` => no new head sample)
+				let req = if t != last { t } else { last };
 				last = t;
-				info!("recenter requested");
-				if let Err(e) = curved_placement(&client, &spatial_root, curve, t).await {
+				last_adj = ta;
+				info!("recenter/adjust requested");
+				if let Err(e) = curved_placement(&client, &spatial_root, curve, req).await {
 					tracing::warn!("recenter failed: {e:?}");
 				}
 			}
